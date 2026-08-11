@@ -63,6 +63,11 @@ class Config:
     db_path: str = field(default_factory=lambda: _env("DB_PATH", "sniper.db"))
     poll_seconds: int = field(default_factory=lambda: int(_env("POLL_SECONDS", "120")))
 
+    # регион в адресе Авито: sankt-peterburg, moskva, ekaterinburg и т.д.
+    region: str = field(
+        default_factory=lambda: _env("AVITO_REGION", "sankt-peterburg")
+    )
+
     # ссылки на сохранённые фильтры Авито, через запятую
     search_urls: list[str] = field(
         default_factory=lambda: [
@@ -70,12 +75,17 @@ class Config:
         ]
     )
 
+    # csv с прошлыми сделками друга — чтобы медиана заработала сразу
+    seed_path: str = field(default_factory=lambda: _env("SEED_PATH", "seed_deals.csv"))
+
     # экономика: желаемая маржа и резерв на предпродажную подготовку
     target_margin: float = field(
         default_factory=lambda: float(_env("TARGET_MARGIN", "0.25"))
     )
     prep_reserve: int = field(default_factory=lambda: int(_env("PREP_RESERVE", "3000")))
     max_price: int = field(default_factory=lambda: int(_env("MAX_PRICE", "80000")))
+    # сколько наблюдений нужно, чтобы доверять медиане
+    min_sample: int = field(default_factory=lambda: int(_env("MIN_SAMPLE", "3")))
 
     # пока нет живого источника — работаем на mock_listings.json
     use_mock: bool = field(
@@ -294,12 +304,30 @@ class HttpSource:
         return results
 
 
+def default_search_url() -> str:
+    """Запасная ссылка, если свои фильтры ещё не настроены.
+
+    Это грубая выдача по всей категории. Нормальный вариант — настроить
+    фильтр руками на сайте и скопировать готовую ссылку из адресной строки:
+    коды параметров у Авито недокументированы и меняются, угадывать их
+    бессмысленно.
+    """
+    return f"https://www.avito.ru/{CFG.region}/noutbuki"
+
+
 def make_source():
-    if CFG.use_mock or not CFG.search_urls:
+    if CFG.use_mock:
         log.info("Источник: mock_listings.json")
         return MockSource()
-    log.info("Источник: %d сохранённых фильтров", len(CFG.search_urls))
-    return HttpSource(CFG.search_urls)
+    urls = CFG.search_urls or [default_search_url()]
+    if not CFG.search_urls:
+        log.warning(
+            "SEARCH_URLS не задан — беру всю категорию по региону %s. "
+            "Это много шума, настройте свои фильтры.",
+            CFG.region,
+        )
+    log.info("Источник: %d ссылок", len(urls))
+    return HttpSource(urls)
 
 
 # ------------------------------------------------------- разбор характеристик
@@ -430,7 +458,7 @@ def estimate_price(raw: RawListing, specs: dict[str, Any]) -> Estimate:
     key = model_key(specs)
     history = [p for p in STORE.prices_for_model(key) if p > 0]
 
-    fair = int(statistics.median(history)) if len(history) >= 4 else None
+    fair = int(statistics.median(history)) if len(history) >= CFG.min_sample else None
 
     # объявления с флагами риска не оцениваем — только глазами
     hard_risks = {"не включается", "на запчасти", "следы залития", "менялась видеокарта"}
@@ -455,6 +483,16 @@ def estimate_price(raw: RawListing, specs: dict[str, Any]) -> Estimate:
 
 
 # ------------------------------------------------------------- текст сообщения
+
+
+def html_escape(text: str) -> str:
+    """Экранируем спецсимволы, иначе Telegram не разберёт разметку."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def copyable(text: str) -> str:
+    """Моноширинный блок: тап по нему копирует текст в буфер обмена."""
+    return f"<code>{html_escape(text)}</code>"
 
 
 def rub(amount: int) -> str:
@@ -585,9 +623,10 @@ async def on_take(callback: CallbackQuery) -> None:
     )
     STORE.set_status(listing_id, "offered")
     await callback.message.answer(
-        "Текст для продавца — скопируйте и вставьте в чат объявления:\n\n"
-        + compose_message(specs, est)
-        + f"\n\n{row['url']}"
+        "Тапните по тексту — скопируется. Дальше открывайте объявление и вставляйте:\n\n"
+        + copyable(compose_message(specs, est))
+        + f"\n\n{row['url']}",
+        parse_mode="HTML",
     )
     await callback.answer("Готово")
 
@@ -623,7 +662,10 @@ async def on_custom_price(message: Message) -> None:
     specs = json.loads(row["specs_json"])
     est = Estimate(row["fair_price"], price, 0, json.loads(row["risks_json"]), "take")
     await message.answer(
-        "Текст для продавца:\n\n" + compose_message(specs, est) + f"\n\n{row['url']}"
+        "Тапните по тексту — скопируется:\n\n"
+        + copyable(compose_message(specs, est))
+        + f"\n\n{row['url']}",
+        parse_mode="HTML",
     )
 
 
@@ -682,7 +724,57 @@ async def poll_loop(bot: Bot) -> None:
         await asyncio.sleep(CFG.poll_seconds)
 
 
+def import_seed(path: str) -> int:
+    """Подгружаем прошлые сделки друга как стартовую историю цен.
+
+    Формат csv (первая строка — заголовок):
+        brand,cpu,ram_gb,storage_gb,buy_price,sell_price,days_to_sell
+
+    Именно sell_price идёт в базу как наблюдение рынка: это цена, по которой
+    ноутбук реально ушёл, а не по которой висел. Такая медиана честнее той,
+    что бот насчитает по объявлениям.
+    """
+    if not os.path.exists(path):
+        return 0
+
+    import csv
+
+    added = 0
+    with open(path, encoding="utf-8") as f:
+        for i, row in enumerate(csv.DictReader(f)):
+            try:
+                sell = int(row["sell_price"])
+            except (KeyError, ValueError):
+                continue
+            specs = {
+                "brand": (row.get("brand") or "").strip().lower() or None,
+                "cpu": (row.get("cpu") or "").strip().lower() or None,
+                "ram_gb": int(row["ram_gb"]) if row.get("ram_gb") else None,
+                "storage_gb": int(row["storage_gb"]) if row.get("storage_gb") else None,
+            }
+            STORE.insert(
+                {
+                    "id": f"seed-{i}",
+                    "title": f"[сделка] {specs['brand'] or ''} {specs['cpu'] or ''}".strip(),
+                    "price": sell,
+                    "url": "",
+                    "description": "",
+                    "model_key": model_key(specs),
+                    "specs_json": json.dumps(specs, ensure_ascii=False),
+                    "risks_json": "[]",
+                    "fair_price": None,
+                    "offer_price": int(row["buy_price"]) if row.get("buy_price") else None,
+                }
+            )
+            STORE.set_status(f"seed-{i}", "seed")
+            added += 1
+    return added
+
+
 async def main() -> None:
+    seeded = import_seed(CFG.seed_path)
+    if seeded:
+        log.info("Загружено прошлых сделок: %d", seeded)
     bot = Bot(CFG.telegram_token)
     asyncio.create_task(poll_loop(bot))
     await dp.start_polling(bot)
