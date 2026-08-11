@@ -204,6 +204,15 @@ class MockSource:
         return [RawListing(**item) for item in data]
 
 
+def _unescape(text: str) -> str:
+    """Раскодируем \\uXXXX в заголовке. Через json, а не unicode_escape:
+    последний ломает кириллицу, если она пришла как есть."""
+    try:
+        return json.loads(f'"{text}"')
+    except json.JSONDecodeError:
+        return text
+
+
 class HttpSource:
     """Простое чтение страницы выдачи по сохранённому фильтру.
 
@@ -246,25 +255,40 @@ class HttpSource:
 
     @staticmethod
     def _extract(html: str) -> list[RawListing]:
-        """Достаём объявления из встроенного в страницу JSON."""
+        """Достаём объявления из встроенного в страницу JSON.
+
+        Ссылку берём готовую из поля пути, а не собираем из id: у объявления
+        адрес вида /город/категория/название_id, и восстановить его по одному
+        id нельзя — получится несуществующий путь и редирект на общий раздел.
+        """
         results: list[RawListing] = []
-        blocks = re.findall(
-            r'"id"\s*:\s*(\d{6,}).{0,400}?"title"\s*:\s*"([^"]{5,200})".{0,400}?'
-            r'"price"\s*:\s*\{[^}]*?"value"\s*:\s*(\d+)',
-            html,
-            flags=re.S,
-        )
         seen: set[str] = set()
-        for item_id, title, price in blocks:
+
+        for m in re.finditer(r'"id"\s*:\s*(\d{6,})', html):
+            item_id = m.group(1)
             if item_id in seen:
                 continue
+            window = html[m.end() : m.end() + 2500]
+
+            title_m = re.search(r'"title"\s*:\s*"([^"]{5,200})"', window)
+            price_m = re.search(r'"price"\s*:\s*\{[^}]*?"value"\s*:\s*(\d+)', window)
+            path_m = re.search(r'"urlPath"\s*:\s*"(/[^"]{10,300})"', window)
+            if not (title_m and price_m and path_m):
+                continue
+
+            path = path_m.group(1)
+            # путь объявления заканчивается тем же id — так отсеиваем
+            # статьи журнала и прочие блоки, случайно попавшие в разметку
+            if not path.rstrip("/").endswith(item_id):
+                continue
+
             seen.add(item_id)
             results.append(
                 RawListing(
                     id=item_id,
-                    title=title.encode().decode("unicode_escape", errors="ignore"),
-                    price=int(price),
-                    url=f"https://www.avito.ru/items/{item_id}",
+                    title=_unescape(title_m.group(1)),
+                    price=int(price_m.group(1)),
+                    url="https://www.avito.ru" + path,
                 )
             )
         return results
