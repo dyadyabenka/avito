@@ -5,7 +5,7 @@
   источник -> новые объявления -> разбор характеристик (LLM) -> оценка цены
   -> карточка в Telegram с кнопками -> человек решает.
 
-Запуск:  python avito_sniper.py
+Запуск:  python main.py
 Переменные окружения — см. .env.example
 """
 
@@ -21,6 +21,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+try:  # необязательная зависимость: локально удобно, на хостинге не нужна
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -86,6 +94,14 @@ class Config:
     max_price: int = field(default_factory=lambda: int(_env("MAX_PRICE", "80000")))
     # сколько наблюдений нужно, чтобы доверять медиане
     min_sample: int = field(default_factory=lambda: int(_env("MIN_SAMPLE", "3")))
+    # слать всё подряд, включая дорогие лоты (иначе бот молчит про них)
+    notify_all: bool = field(
+        default_factory=lambda: _env("NOTIFY_ALL", "1") not in ("0", "false", "no")
+    )
+    # пропускать только частных продавцов
+    only_private: bool = field(
+        default_factory=lambda: _env("ONLY_PRIVATE", "1") not in ("0", "false", "no")
+    )
 
     # пока нет живого источника — работаем на mock_listings.json
     use_mock: bool = field(
@@ -107,6 +123,7 @@ CREATE TABLE IF NOT EXISTS listings (
     description  TEXT DEFAULT '',
     model_key    TEXT DEFAULT '',
     specs_json   TEXT DEFAULT '{}',
+    gpu          TEXT DEFAULT '',
     risks_json   TEXT DEFAULT '[]',
     fair_price   INTEGER,
     offer_price  INTEGER,
@@ -115,6 +132,7 @@ CREATE TABLE IF NOT EXISTS listings (
     last_seen    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_model ON listings(model_key);
+CREATE INDEX IF NOT EXISTS idx_gpu ON listings(gpu);
 """
 
 
@@ -123,7 +141,16 @@ class Store:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Добавляем недостающие колонки в базы, созданные ранними версиями."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(listings)")}
+        for name, ddl in (("gpu", "TEXT DEFAULT ''"),):
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {ddl}")
+                log.info("База обновлена: добавлена колонка %s", name)
 
     def is_known(self, listing_id: str) -> bool:
         cur = self.conn.execute("SELECT 1 FROM listings WHERE id = ?", (listing_id,))
@@ -133,10 +160,10 @@ class Store:
         now = int(time.time())
         self.conn.execute(
             """INSERT OR IGNORE INTO listings
-               (id, title, price, url, description, model_key, specs_json,
+               (id, title, price, url, description, model_key, specs_json, gpu,
                 risks_json, fair_price, offer_price, status, first_seen, last_seen)
                VALUES (:id, :title, :price, :url, :description, :model_key,
-                       :specs_json, :risks_json, :fair_price, :offer_price,
+                       :specs_json, :gpu, :risks_json, :fair_price, :offer_price,
                        'new', :now, :now)""",
             {**row, "now": now},
         )
@@ -173,6 +200,52 @@ class Store:
         )
         return [r["price"] for r in cur.fetchall()]
 
+    def market_by_gpu(self, gpu: str, days: int = 60) -> dict[str, Any] | None:
+        """Срез по видеокарте: сколько, почём, какой разброс.
+
+        Берём только объявления, увиденные за последние `days` дней —
+        цены полугодовой давности уже не рынок.
+        """
+        since = int(time.time()) - days * 86400
+        cur = self.conn.execute(
+            """SELECT price, first_seen, last_seen, status, title, url
+               FROM listings
+               WHERE gpu = ? AND price > 0 AND first_seen >= ?
+               ORDER BY price""",
+            (gpu, since),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return None
+
+        prices = [r["price"] for r in rows]
+        # «ушедшие» — те, что перестали появляться в выдаче: приближение к сделке
+        gone = [r for r in rows if r["last_seen"] - r["first_seen"] >= 0 and r["status"] == "gone"]
+        sold_days = [
+            round((r["last_seen"] - r["first_seen"]) / 86400) for r in gone
+        ]
+        return {
+            "count": len(prices),
+            "median": int(statistics.median(prices)),
+            "p25": int(statistics.quantiles(prices, n=4)[0]) if len(prices) >= 4 else min(prices),
+            "p75": int(statistics.quantiles(prices, n=4)[2]) if len(prices) >= 4 else max(prices),
+            "min": min(prices),
+            "max": max(prices),
+            "sold_n": len(sold_days),
+            "sold_days": int(statistics.median(sold_days)) if sold_days else None,
+            "cheapest": (rows[0]["title"], rows[0]["price"], rows[0]["url"]),
+        }
+
+    def known_gpus(self, days: int = 60) -> list[tuple[str, int]]:
+        since = int(time.time()) - days * 86400
+        cur = self.conn.execute(
+            """SELECT gpu, COUNT(*) c FROM listings
+               WHERE gpu != '' AND first_seen >= ?
+               GROUP BY gpu ORDER BY c DESC""",
+            (since,),
+        )
+        return [(r["gpu"], r["c"]) for r in cur.fetchall()]
+
     def stats(self) -> dict[str, int]:
         cur = self.conn.execute(
             "SELECT status, COUNT(*) c FROM listings GROUP BY status"
@@ -193,6 +266,34 @@ class RawListing:
     price: int
     url: str
     description: str = ""
+    seller_hint: str = ""  # что удалось узнать о продавце из выдачи
+
+
+SHOP_MARKERS = (
+    r"гаранти[яию]",
+    r"\bчек\b|кассовый чек|товарный чек",
+    r"рассрочк|кредит|trade-?in|трейд-?ин",
+    r"запечатан|новый в упаковке|заводская упаковк",
+    r"в наличии|под заказ|большой выбор|ассортимент",
+    r"доставка по росси|отправ(им|ка) в регион",
+    r"магазин|салон|сервисный центр|шоурум|розниц",
+    r"юр\.?\s?лиц|ооо|ип\b|безнал|ндс",
+    r"проверка перед оплатой|обмен и возврат",
+)
+
+
+def looks_like_shop(raw: RawListing) -> bool:
+    """Отсев магазинов, протекающих в выдачу через продвижение.
+
+    Один маркер — не приговор: частник тоже может написать «в наличии».
+    Считаем магазином при двух и более совпадениях, либо если площадка
+    прямо отдала признак компании.
+    """
+    if re.search(r"company|shop|магазин", raw.seller_hint, re.I):
+        return True
+    text = f"{raw.title} {raw.description}".lower()
+    hits = sum(1 for pat in SHOP_MARKERS if re.search(pat, text))
+    return hits >= 2
 
 
 class MockSource:
@@ -292,6 +393,12 @@ class HttpSource:
             if not path.rstrip("/").endswith(item_id):
                 continue
 
+            desc_m = re.search(r'"description"\s*:\s*"([^"]{0,600})"', window)
+            seller_m = re.search(
+                r'"(?:sellerType|userType|company|shopName)"\s*:\s*"?([A-Za-zА-Яа-я_]+)"?',
+                window,
+            )
+
             seen.add(item_id)
             results.append(
                 RawListing(
@@ -299,6 +406,8 @@ class HttpSource:
                     title=_unescape(title_m.group(1)),
                     price=int(price_m.group(1)),
                     url="https://www.avito.ru" + path,
+                    description=_unescape(desc_m.group(1)) if desc_m else "",
+                    seller_hint=seller_m.group(1) if seller_m else "",
                 )
             )
         return results
@@ -421,13 +530,60 @@ def _fallback_specs(raw: RawListing) -> dict[str, Any]:
         "cpu": cpu.group(1) if cpu else None,
         "ram_gb": int(ram.group(1)) if ram else None,
         "storage_gb": int(storage.group(1)) if storage else None,
-        "gpu": None,
+        "gpu": normalize_gpu(f"{raw.title} {raw.description}"),
         "screen_inch": None,
         "year": None,
         "condition": "unknown",
         "risks": [label for label, pat in RISK_PATTERNS.items() if re.search(pat, text)],
         "confidence": 0.3,
     }
+
+
+GPU_PATTERNS = [
+    # (регулярка, нормализованное имя)
+    (r"\brtx\s*-?\s*(50[6-9]0|40[5-9]0|30[5-9]0|20[6-8]0)\s*(ti|super)?\b", "RTX {0}{1}"),
+    (r"\bgtx\s*-?\s*(10[5-8]0|16[5-6]0|9[5-8]0)\s*(ti|super)?\b", "GTX {0}{1}"),
+    (r"\b(?:rx)\s*-?\s*(6[5-8]00|7[6-8]00|5[5-7]00)\s*(xt|m)?\b", "RX {0}{1}"),
+    (r"\biris\s*xe\b", "Iris Xe"),
+    (r"\bradeon\s+graphics\b", "Radeon (встроенная)"),
+    (r"\buhd\s*graphics\b", "UHD (встроенная)"),
+]
+
+
+def normalize_gpu(text: str) -> str | None:
+    """Приводим видеокарту к единому виду: 'gtx1050ti', 'GTX 1050 Ti',
+    '1050ti' — всё это должно попасть в одну корзину."""
+    low = text.lower()
+    for pattern, template in GPU_PATTERNS:
+        m = re.search(pattern, low)
+        if not m:
+            continue
+        if not m.groups():
+            return template
+        num = m.group(1)
+        suffix = (m.group(2) or "").strip()
+        suffix_out = f" {suffix.capitalize()}" if suffix else ""
+        return template.format(num, suffix_out)
+
+    # голое число модели без префикса: «видеокарта 1650», «на 1060»
+    m = re.search(
+        r"\b(?:видеокарт\w*|карта|gpu|nvidia|geforce|nv|на)\s+(\d{4})\s*(ti|super)?\b",
+        low,
+    )
+    if m:
+        num = m.group(1)
+        suffix = (m.group(2) or "").strip()
+        suffix_out = f" {suffix.capitalize()}" if suffix else ""
+        prefix = "RTX" if num.startswith(("20", "30", "40", "50")) else "GTX"
+        return f"{prefix} {num}{suffix_out}"
+    return None
+
+
+def gpu_key(gpu: str | None) -> str:
+    """Ключ для группировки: 'RTX 3050 Ti' -> 'rtx3050ti'."""
+    if not gpu:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", gpu.lower())
 
 
 def model_key(specs: dict[str, Any]) -> str:
@@ -546,7 +702,7 @@ def compose_card(raw: RawListing, specs: dict[str, Any], est: Estimate) -> str:
     ) or "характеристики не распознаны"
 
     lines = [
-        f"{raw.title}",
+        ("[ТЕСТ] " if CFG.use_mock else "") + f"{raw.title}",
         f"Цена в объявлении: {rub(raw.price)}",
         f"Характеристики: {spec_line}",
     ]
@@ -602,6 +758,58 @@ async def cmd_stats(message: Message) -> None:
         f"Новых: {s.get('new', 0)}\n"
         f"Написали: {s.get('offered', 0)}\n"
         f"Пропущено: {s.get('skipped', 0)}"
+    )
+
+
+@dp.message(Command("market"))
+async def cmd_market(message: Message) -> None:
+    """/market 1050 1060 1070 — срез рынка по видеокартам."""
+    args = (message.text or "").split()[1:]
+    if not args:
+        known = STORE.known_gpus()
+        if not known:
+            await message.answer(
+                "В базе пока нет объявлений с распознанной видеокартой.\n"
+                "Дайте боту поработать несколько дней."
+            )
+            return
+        top = "\n".join(f"  {g} — {c} шт." for g, c in known[:15])
+        await message.answer(
+            "Укажите видеокарты: /market 1050 1060 1070\n\n"
+            f"Что есть в базе за 60 дней:\n{top}"
+        )
+        return
+
+    blocks: list[str] = []
+    for arg in args[:6]:
+        gpu_name = normalize_gpu(f"видеокарта {arg}") or arg.upper()
+        data = STORE.market_by_gpu(gpu_key(gpu_name))
+        if data is None:
+            blocks.append(f"{gpu_name}: в базе нет данных")
+            continue
+
+        spread = data["max"] - data["min"]
+        lines = [
+            f"{gpu_name} — {data['count']} объявлений за 60 дней",
+            f"  медиана {rub(data['median'])}",
+            f"  половина рынка: {rub(data['p25'])} — {rub(data['p75'])}",
+            f"  разброс: {rub(data['min'])} — {rub(data['max'])}",
+        ]
+        if data["sold_days"] is not None:
+            lines.append(
+                f"  уходит за ~{data['sold_days']} дн. (по {data['sold_n']} лотам)"
+            )
+        else:
+            lines.append("  скорости продажи пока нет — мало истории")
+        if data["count"] < 10:
+            lines.append("  выборка маленькая, цифрам верить рано")
+        if spread > data["median"]:
+            lines.append("  разброс шире медианы — внутри разные конфигурации")
+        blocks.append("\n".join(lines))
+
+    await message.answer(
+        "\n\n".join(blocks)
+        + "\n\nЭто цены предложения, а не сделок: часть лотов не продастся."
     )
 
 
@@ -673,6 +881,18 @@ async def on_custom_price(message: Message) -> None:
 
 
 async def process_listing(bot: Bot, raw: RawListing) -> None:
+    if CFG.only_private and looks_like_shop(raw):
+        log.info("Магазин, пропуск: %s", raw.title[:60])
+        STORE.insert(
+            {
+                "id": raw.id, "title": raw.title, "price": raw.price, "url": raw.url,
+                "description": raw.description, "model_key": "", "specs_json": "{}",
+                "gpu": "", "risks_json": "[]", "fair_price": None, "offer_price": None,
+            }
+        )
+        STORE.set_status(raw.id, "shop")
+        return
+
     specs = await parse_specs(raw)
     est = estimate_price(raw, specs)
 
@@ -685,17 +905,18 @@ async def process_listing(bot: Bot, raw: RawListing) -> None:
             "description": raw.description,
             "model_key": model_key(specs),
             "specs_json": json.dumps(specs, ensure_ascii=False),
+            "gpu": gpu_key(specs.get("gpu")),
             "risks_json": json.dumps(est.risks, ensure_ascii=False),
             "fair_price": est.fair,
             "offer_price": est.offer,
         }
     )
 
-    # молча копим статистику по тому, что заведомо не берём
     if est.verdict == "skip":
         STORE.set_status(raw.id, "skipped")
-        log.info("Пропуск (дорого): %s — %s ₽", raw.title[:50], raw.price)
-        return
+        if not CFG.notify_all:
+            log.info("Пропуск (дорого): %s — %s ₽", raw.title[:50], raw.price)
+            return
 
     await bot.send_message(
         CFG.owner_id,
@@ -761,6 +982,7 @@ def import_seed(path: str) -> int:
                     "description": "",
                     "model_key": model_key(specs),
                     "specs_json": json.dumps(specs, ensure_ascii=False),
+                    "gpu": gpu_key(specs.get("gpu")),
                     "risks_json": "[]",
                     "fair_price": None,
                     "offer_price": int(row["buy_price"]) if row.get("buy_price") else None,
@@ -771,11 +993,38 @@ def import_seed(path: str) -> int:
     return added
 
 
+def startup_report() -> str:
+    """Явно говорим, откуда бот берёт данные — чтобы тестовый режим
+    нельзя было спутать с боевым."""
+    if CFG.use_mock:
+        return (
+            "ВНИМАНИЕ: тестовый режим.\n"
+            "Данные берутся из mock_listings.json, объявления выдуманные, "
+            "ссылки никуда не ведут.\n"
+            "Для боевого режима: USE_MOCK=0 и SEARCH_URLS с вашей ссылкой."
+        )
+    lines = [
+        "Боевой режим.",
+        f"Регион: {CFG.region}",
+        f"Фильтров: {len(CFG.search_urls) or 1}",
+        f"Опрос раз в {CFG.poll_seconds} с",
+        f"Только частные: {'да' if CFG.only_private else 'нет'}",
+        f"Слать всё подряд: {'да' if CFG.notify_all else 'нет'}",
+    ]
+    if not CFG.search_urls:
+        lines.append("SEARCH_URLS пуст — беру всю категорию, шума будет много.")
+    return "\n".join(lines)
+
+
 async def main() -> None:
     seeded = import_seed(CFG.seed_path)
     if seeded:
         log.info("Загружено прошлых сделок: %d", seeded)
     bot = Bot(CFG.telegram_token)
+    try:
+        await bot.send_message(CFG.owner_id, startup_report())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Не удалось отправить отчёт о старте: %s", exc)
     asyncio.create_task(poll_loop(bot))
     await dp.start_polling(bot)
 
